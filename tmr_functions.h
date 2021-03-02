@@ -59,6 +59,6 @@ int TimerExit ( XIntc* IntcInstancePtr,
 		u16 DeviceId,
 		u8 TmrCtrNumber );
 
-#define RESET_VALUE	 0xE0000000
+#define RESET_VALUE	 0xE0000000	/* 43 seconds from 0x0 */
 
 #endif /* TMR_FUNCTIONS_H_ */
