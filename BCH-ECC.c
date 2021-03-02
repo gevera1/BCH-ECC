@@ -1,3 +1,25 @@
+/*
+ *	Memory Scrubbing / Error-Correction Application 
+ *	for use on Xilinx Kintex KCU105 FPGA Board
+ *
+ *	This application utilizes Xilinx's provided API's
+ *	for the following IP:
+ *		- AXI Timer
+ *		- AXI Quad SPI Flash Memory
+ *
+ *	As well as the publicly available source code for
+ *	the Linux kernel, specifically from:
+ *		- bch.c 
+ *		- bch.h
+ *
+ *	This software was designed for NASA JSC under the
+ *	Command and Data Handling Branch of the Avionics
+ *	Division: EV-2
+ *
+ *	Author: 	Adrian-James Gevero
+ *	Created:	January 20th, 2021 
+ *
+ */
 
 #include "bch_functions.h"
 #include "flash_functions.h"
@@ -18,6 +40,49 @@ int init( void );
 void exit_app( void );
 
 //================================GLOBAL DECLARATIONS===================================//
+static inline uint32_t CPU_TO_BE32(uint32_t p)
+{
+    const uint8_t * bytes = (const uint8_t *)&p;
+    uint32_t out =
+    ((uint32_t)bytes[0] << 24) |
+    (bytes[1] << 16) |
+    (bytes[2] << 8) |
+    (bytes[3] )  ;
+    return out;
+}
+
+static inline int FLS(uint32_t x)
+{
+    int r=0;
+    if (x>=(1<<16)) { r+=16;x>>=16; }
+    if (x>=(1<< 8)) { r+= 8;x>>= 8; }
+    if (x>=(1<< 4)) { r+= 4;x>>= 4; }
+    if (x>=(1<< 2)) { r+= 2;x>>= 2; }
+    if (x>=(1<< 1)) { r+= 1;x>>= 1; }
+    return r+x;
+}
+
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
+
+#define GF_M(_p)               ((_p)->m)
+#define GF_T(_p)               ((_p)->t)
+#define GF_N(_p)               ((_p)->n)
+
+#ifndef DIV_ROUND_UP
+#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
+#endif
+
+#define BCH_ECC_WORDS(_p)      DIV_ROUND_UP(GF_M(_p)*GF_T(_p), 32)
+#define BCH_ECC_BYTES(_p)      DIV_ROUND_UP(GF_M(_p)*GF_T(_p), 8)
+
+#ifndef dbg
+#ifndef _WIN32
+#define dbg(_fmt, args...)     do {} while (0)
+#else
+#define dbg(_fmt, ...)     do {} while (0)
+#endif
+#endif
+
 /*
  * The instances to support the device drivers are global such that they
  * are initialized to zero each time the program runs. They could be local
@@ -53,14 +118,23 @@ static u8 ReadBuffer[PAGE_SIZE + READ_WRITE_EXTRA_BYTES + 4];
 static u8 WriteBuffer[PAGE_SIZE + READ_WRITE_EXTRA_BYTES];
 static u8 DataBuf[PAGE_SIZE];
 
-static u8 *parity_table[PAGE_COUNT]; /* May not be necessary */
+static u8 *parity_table[PAGE_COUNT]; /* Holds Parity codewords in local memory */
 
 struct bch_control		*BCHptr;
 
 static volatile int Status;
 
 //===================================MAIN FUNCTION======================================//
-
+/*
+ *	Main Function
+ *	
+ *	@param 	N/A
+ *	
+ * 	@return XST_FAILURE upon failure during runtime, XST_SUCCESS otherwise
+ *
+ *	@note 	Contains infinite loop to perform periodic decoding.
+ *
+ */
 int main( void )
 {
 	int 					Status, page_num, n_err;
@@ -70,6 +144,7 @@ int main( void )
 
 	data_addr 	= DATA_START_ADDRESS;	/* 0x0 */
 
+	/* Perform initialization for Flash, BCH, and AXI Timer */
 	Status = init();
 	if (Status != XST_SUCCESS) {
 		printf("init() failure\n");
@@ -77,14 +152,17 @@ int main( void )
 		return XST_FAILURE;
 	}
 
+	/* Allocate memory and set variables related to the bch struct */
 	par_size 		= BCHptr->ecc_bytes;
 	err_loc			= (unsigned int *) malloc(T * sizeof(unsigned int));
 	parity_array 	= (u8 *) malloc(par_size);
 
+	/* Read and Encode all data in Flash image by Page */
 	for (page_num = 0; page_num < PAGE_COUNT; page_num++, data_addr += 0x100)
 	{
 		parity_table[page_num] = (u8 *) malloc(par_size);
 
+		/* Read Page from Flash memory at data_addr */
 		Status = FlashRead(&Spi, data_addr, PAGE_SIZE, DataBuf);
 		if (Status != XST_SUCCESS) {
 			printf("ERROR: Read operation\n");
@@ -96,15 +174,20 @@ int main( void )
 		encode_bch(BCHptr, DataBuf, PAGE_SIZE, parity_table[page_num]);
 	}
 
+	/* Reset data_addr to 0x0 */
 	data_addr = DATA_START_ADDRESS;
+
+	/* Begin infinite loop for periodic decoding and error-correction */
 	while (1)
 	{
-		while (!TimerExpired){}
+		while (!TimerExpired){}		/* Wait for expiration of timer (Depends on RESET_VALUE) */
 
+		/* Once timer has expired, comb through pages of memory and check for errors */
 		for (page_num = 0; page_num < PAGE_COUNT; page_num++, data_addr += 0x100) {
 			memset(parity_array, 0, par_size);
 			memset(err_loc, 0, T * sizeof(unsigned int));
 
+			/* Read page of memory at data_addr */
 			Status = FlashRead(&Spi, data_addr, PAGE_SIZE, DataBuf);
 			if (Status != XST_SUCCESS) {
 				printf("ERROR: Read operation\n");
@@ -112,13 +195,16 @@ int main( void )
 				return XST_FAILURE;
 			}
 
+			/* Copy codewords into allocated array for ease of use in BCH functions */
 			memcpy(parity_array, parity_table[page_num], par_size);
 
+			/* Decode data and codewords and return number of detected errors */
 			n_err = decode_bch(BCHptr, DataBuf, PAGE_SIZE, parity_array, parity_table[page_num], 0, err_loc);
 
+			/* If error(s) exists, correct it/them ; Correct up to 3 errors per page of data */
 			if (n_err > 0) {
-				correct_bch(BCHptr, DataBuf, PAGE_SIZE, err_loc, n_err);
-				Status = FlashWrite(&Spi, data_addr, PAGE_SIZE, DataBuf);
+				correct_bch(BCHptr, DataBuf, PAGE_SIZE, err_loc, n_err);	/* Correct data in buffer */
+				Status = FlashWrite(&Spi, data_addr, PAGE_SIZE, DataBuf);	/* Write buffer to memory */
 				if (Status != XST_SUCCESS) {
 					printf("Correction write failure\n");
 					exit_app();
@@ -126,12 +212,20 @@ int main( void )
 				}
 			}
 		}
-		TimerExpired = 0;
+		TimerExpired = 0;	/* Reset timer */
 	}
-	exit_app();
+	exit_app();				/* Security for exiting app */
 	return XST_SUCCESS;
 }
 
+/*
+ *	Initialization function for Timer, Interrupt, Flash, and BCH
+ *
+ *	@param 	N/A
+ *
+ *	@return XST_FAILURE upon runtime failure, XST_SUCCESS otherwise
+ *
+ */
 int init( void )
 {
 	Status = SetupInterruptSystem(&Spi,
@@ -167,6 +261,7 @@ int init( void )
 	return XST_SUCCESS;
 }
 
+/* Performs exit functions for Flash, BCH, and Timer */
 void exit_app( void )
 {
 	/* Perform Exit operations/clean up */
@@ -241,6 +336,7 @@ int TimerInit( XIntc* IntcInstancePtr,
 	return XST_SUCCESS;
 }
 
+/* Performs all TmrCtr operations for a clean exit */
 int TimerExit ( XIntc* IntcInstancePtr,
 		XTmrCtr* TmrCtrInstancePtr,
 		u16 DeviceId,
@@ -384,6 +480,7 @@ int SpiFlashClear	( XSpi *SpiPtr, u32 Addr, int cmd )
 		return XST_FAILURE;
 	}
 
+	/* Either perform Sector or Bulk erase dependent on cmd */
 	switch (cmd) {
 		case (1) :
 			if (SpiFlashSectorErase(SpiPtr, Addr) != XST_SUCCESS) {
@@ -1043,50 +1140,7 @@ int SetupInterruptSystem(XSpi *SpiPtr,
 	return XST_SUCCESS;
 }
 
-static
-inline
-uint32_t CPU_TO_BE32(uint32_t p)
-{
-    const uint8_t * bytes = (const uint8_t *)&p;
-    uint32_t out =
-    ((uint32_t)bytes[0] << 24) |
-    (bytes[1] << 16) |
-    (bytes[2] << 8) |
-    (bytes[3] )  ;
-    return out;
-}
-
-static inline int FLS(uint32_t x)
-{
-    int r=0;
-    if (x>=(1<<16)) { r+=16;x>>=16; }
-    if (x>=(1<< 8)) { r+= 8;x>>= 8; }
-    if (x>=(1<< 4)) { r+= 4;x>>= 4; }
-    if (x>=(1<< 2)) { r+= 2;x>>= 2; }
-    if (x>=(1<< 1)) { r+= 1;x>>= 1; }
-    return r+x;
-}
-
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
-
-#define GF_M(_p)               ((_p)->m)
-#define GF_T(_p)               ((_p)->t)
-#define GF_N(_p)               ((_p)->n)
-
-#ifndef DIV_ROUND_UP
-#define DIV_ROUND_UP(n,d) (((n) + (d) - 1) / (d))
-#endif
-
-#define BCH_ECC_WORDS(_p)      DIV_ROUND_UP(GF_M(_p)*GF_T(_p), 32)
-#define BCH_ECC_BYTES(_p)      DIV_ROUND_UP(GF_M(_p)*GF_T(_p), 8)
-
-#ifndef dbg
-#ifndef _WIN32
-#define dbg(_fmt, args...)     do {} while (0)
-#else
-#define dbg(_fmt, ...)     do {} while (0)
-#endif
-#endif
+//===================== BCH FUNCTIONS =============================//
 
 /*
  * represent a polynomial over GF(2^m)
@@ -2395,5 +2449,4 @@ void correct_bch(struct bch_control *bch, uint8_t *data, unsigned int len,unsign
         if ( (bi>>3) < (int) len)
             data[bi>>3] ^= (1<<(bi&7));
     }
-
 }
